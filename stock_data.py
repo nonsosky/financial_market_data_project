@@ -1,16 +1,19 @@
 import os
-import dotenv
+from dotenv import load_dotenv
 import yfinance as yf
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit
+from pyspark.sql.functions import col
 from pyspark.sql.functions import monotonically_increasing_id
-import pandas as pd
+from pyspark.sql.functions import year, month, dayofmonth, quarter, date_format
 import pyspark
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base
+import psycopg2
 
 # Initialize Spark session
-spark = SparkSession.builder.appName("StockData").getOrCreate()
+spark = SparkSession.builder \
+    .appName("StockData") \
+    .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
+    .config("spark.jars", "postgresql-42.7.4.jar") \
+    .getOrCreate()
 
 #Data Ingestion for YahooFinance
 
@@ -53,12 +56,12 @@ stock_data_df = dataframes[0]
 for df in dataframes[1:]:
     stock_data_df = stock_data_df.unionByName(df)
 
-# Step 6: Save as Parquet
+
 stock_data_df.write.mode("overwrite").option("header", True).csv("dataset/merged_stock_data")
 
-# Step 7: Inspect result
-stock_data_df.printSchema()
-stock_data_df.show(50)
+
+# stock_data_df.printSchema()
+# stock_data_df.show(50)
 
 
 # Data Transformation
@@ -79,46 +82,123 @@ for col_name, dtype in stock_data_df.dtypes:
 # Convert Date to Date datatype
 stock_data_df = stock_data_df.withColumn("Date", pyspark.sql.functions.to_date(stock_data_df["Date"], "yyyy/M/d"))
 
-stock_data_df.printSchema()
-stock_data_df.show(50)
+# stock_data_df.printSchema()
+# stock_data_df.show(50)
 
-# Adding a unique ID column to the DF
-# cleaned_data = stock_data_df.select('Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Ticker') \
-#                         .withColumn('Id', monotonically_increasing_id()) \
-#                         .select('Id', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Ticker')
+# Sort the entire DataFrame by the Date column in descending order
+stock_data_df = stock_data_df.orderBy(col("Date").desc())
 
-# cleaned_data.show(20)
+# stock_data_df.printSchema()
+# stock_data_df.show(50)
 
-# Data Loading
-#Loading Layer
-# Base = declarative_base()
+dim_company_df = stock_data_df.select('Ticker', 'Company').dropDuplicates()
+# dim_company_df.show(50)
 
-# class Stock_Price(Base):
-#     __tablename__ = 'new_stock'
+dim_date_df = stock_data_df.select("Date").distinct() \
+    .withColumn("Year", year("Date")) \
+    .withColumn("Month", month("Date")) \
+    .withColumn("Quarter", quarter("Date")) \
+    .withColumn("DayOfWeek", date_format("Date", "E")) \
+    .withColumn("IsWeekend", date_format("Date", "u").cast("int") >= 6)
 
-#     Id = Column(Integer, primary_key=True)
-#     Date = Column(DateTime)
-#     Open = Column(Float)
-#     High = Column(Float)
-#     Low = Column(Float)
-#     Close = Column(Float)
-#     Volume = Column(Integer)
-#     Ticker = Column(String)
+dim_date_df = dim_date_df.orderBy(col("Date").desc())
 
-# DB_NAME = os.getenv("DB_NAME")
-# DB_USER = os.getenv("DB_USER")
-# DB_PORT = os.getenv("DB_PORT")
-# DB_PASS = os.getenv("DB_PASS")
-# DB_HOST = os.getenv("DB_HOSTS")
+dim_date_df.printSchema()
 
-# dotenv.load_dotenv()
-# engine = create_engine(f'postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}')
+fact_table = stock_data_df.join(dim_company_df.alias('c'), ['Ticker'], 'inner') \
+    .join(dim_date_df.alias('d'), ['Date'], 'inner') \
+    .select('Date', 'Ticker', 'Open', 'High', 'Low', 'Close', 'Volume')
 
-# Session = sessionmaker(bind=engine)
-# session = Session()
-# Base.metadata.create_all(engine)
+fact_table = fact_table.orderBy(col("Date").desc())
 
-# data_to_insert = cleaned_data.to_dict(orient='records')
-# session.bulk_insert_mappings(Stock_Price, data_to_insert)
-# session.commit()
-# session.close()
+fact_table = fact_table.withColumn('Id', monotonically_increasing_id()) \
+            .select('Id', 'Date', 'Ticker', 'Open', 'High', 'Low', 'Close', 'Volume')
+
+fact_table.printSchema()
+
+try:
+     
+    # Develop a function to get the Database connection
+    load_dotenv(override=True)
+
+    DB_NAME = os.getenv("DB_NAME")
+    DB_USER = os.getenv("DB_USER")
+    DB_PORT = os.getenv("DB_PORT")
+    DB_PASS = os.getenv("DB_PASS")
+    DB_HOST = os.getenv("DB_HOSTS")
+
+    def get_db_connection():
+        connection = psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        port=DB_PORT,
+        options="-c search_path=finance_market"
+        )
+        return connection
+
+    #connect to our database
+    conn = get_db_connection()
+
+    # Create a function create tables
+    def create_tables():
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        create_table_query = '''
+
+                            CREATE SCHEMA IF NOT EXISTS finance_market;
+
+                            DROP TABLE IF EXISTS finance_market.company CASCADE;
+                            DROP TABLE IF EXISTS finance_market.date CASCADE;
+                            DROP TABLE IF EXISTS finance_market.fact_table CASCADE;
+
+
+                            CREATE TABLE IF NOT EXISTS finance_market.company(
+                                ticker VARCHAR(1000) PRIMARY KEY,
+                                company VARCHAR(1000)
+                            );
+
+                            CREATE TABLE IF NOT EXISTS finance_market.date(
+                                date DATE PRIMARY KEY,
+                                year INT,
+                                month INT,
+                                quarter INT,
+                                dayofweek VARCHAR(1000),
+                                isweekend BOOLEAN
+                            );
+
+                            CREATE TABLE IF NOT EXISTS finance_market.fact_table(
+                                id BIGINT PRIMARY KEY,
+                                date DATE,
+                                ticker VARCHAR(1000),
+                                open DOUBLE PRECISION,
+                                high DOUBLE PRECISION,
+                                low DOUBLE PRECISION,
+                                close DOUBLE PRECISION,
+                                volume DOUBLE PRECISION,
+                                FOREIGN KEY (date) REFERENCES finance_market.date(date),
+                                FOREIGN KEY (ticker) REFERENCES finance_market.company(ticker)
+                            );
+
+                    '''
+        cursor.execute(create_table_query)
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    create_tables()
+
+    url = f"jdbc:postgresql://{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    properties = {
+        "user": DB_USER,
+        "password": DB_PASS,
+        "driver": "org.postgresql.Driver"
+    }
+            
+    dim_company_df.write.jdbc(url=url, table="finance_market.company",  mode="append", properties=properties)
+    dim_date_df.write.jdbc(url=url, table="finance_market.date",  mode="append", properties=properties)
+    fact_table.write.jdbc(url=url, table="finance_market.fact_table",  mode="append", properties=properties)
+    print('database, table and data loaded successfully')
+except Exception as e:
+    print("Data loading Failed!", e)
