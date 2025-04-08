@@ -86,7 +86,7 @@ stock_data_df = stock_data_df.withColumn("Date", pyspark.sql.functions.to_date(s
 # stock_data_df.show(50)
 
 # Sort the entire DataFrame by the Date column in descending order
-stock_data_df = stock_data_df.orderBy(col("Date").desc())
+#stock_data_df = stock_data_df.orderBy(col("Date").desc())
 
 # stock_data_df.printSchema()
 # stock_data_df.show(50)
