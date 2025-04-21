@@ -1,5 +1,6 @@
 from spark_utils import getSparkSession
 from dotenv import load_dotenv
+from pyspark.sql.functions import col
 import psycopg2
 import os
 
@@ -9,10 +10,16 @@ def run_loading():
 
         #Initialize Spark Session
         spark = getSparkSession()
+     
+        load_finance_df = spark.read.parquet("/home/kenneth/airflow/finance_market_dag/dataset/cleaned_data/finance_cleaned_data")
 
-        dim_date_df = spark.read.option("header", True).csv("finance_market_dag/dataset/cleaned_data/date")
-        dim_company_df = spark.read.option("header", True).csv("finance_market_dag/dataset/cleaned_data/company")
-        fact_table = spark.option("header", True).csv("finance_market_dag/dataset/cleaned_data/fact_table")
+        # Sort so the most recent dates are at the top
+        load_finance_df = load_finance_df.orderBy(col("Date").desc())
+        load_finance_df.show(50)
+        load_finance_df.printSchema()
+
+        for col_name in load_finance_df.columns:
+            load_finance_df = load_finance_df.withColumnRenamed(col_name, col_name.lower())
 
         # Develop a function to get the Database connection
         load_dotenv(override=True)
@@ -22,6 +29,14 @@ def run_loading():
         DB_PORT = os.getenv("DB_PORT")
         DB_PASS = os.getenv("DB_PASS")
         DB_HOST = os.getenv("DB_HOSTS")
+
+        # JDBC Config
+        url = f"jdbc:postgresql://{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        properties = {
+            "user": DB_USER,
+            "password": DB_PASS,
+            "driver": "org.postgresql.Driver"
+        }
 
         def get_db_connection():
             connection = psycopg2.connect(
@@ -45,27 +60,8 @@ def run_loading():
 
                                 CREATE SCHEMA IF NOT EXISTS finance_market;
 
-                                DROP TABLE IF EXISTS finance_market.company CASCADE;
-                                DROP TABLE IF EXISTS finance_market.date CASCADE;
-                                DROP TABLE IF EXISTS finance_market.fact_table CASCADE;
-
-
-                                CREATE TABLE IF NOT EXISTS finance_market.company(
-                                    ticker VARCHAR(1000) PRIMARY KEY,
-                                    company VARCHAR(1000)
-                                );
-
-                                CREATE TABLE IF NOT EXISTS finance_market.date(
-                                    date DATE PRIMARY KEY,
-                                    year INT,
-                                    month INT,
-                                    quarter INT,
-                                    dayofweek VARCHAR(1000),
-                                    isweekend BOOLEAN
-                                );
-
-                                CREATE TABLE IF NOT EXISTS finance_market.fact_table(
-                                    id BIGINT PRIMARY KEY,
+                                CREATE TABLE IF NOT EXISTS finance_market.finance_market_tbl(
+                                    id BIGSERIAL PRIMARY KEY,
                                     date DATE,
                                     ticker VARCHAR(1000),
                                     open DOUBLE PRECISION,
@@ -73,28 +69,59 @@ def run_loading():
                                     low DOUBLE PRECISION,
                                     close DOUBLE PRECISION,
                                     volume DOUBLE PRECISION,
-                                    FOREIGN KEY (date) REFERENCES finance_market.date(date),
-                                    FOREIGN KEY (ticker) REFERENCES finance_market.company(ticker)
+                                    year INT,
+                                    month INT,
+                                    quarter INT,
+                                    dayofweek VARCHAR(1000),
+                                    isweekend BOOLEAN,
+                                    UNIQUE (ticker, date)
                                 );
 
+                                DROP TABLE IF EXISTS finance_market.temp_finance_market_tbl;
+
+                                CREATE TABLE finance_market.temp_finance_market_tbl AS
+                                SELECT * FROM finance_market.finance_market_tbl WHERE 1=0;
+
                         '''
+
             cursor.execute(create_table_query)
             conn.commit()
             cursor.close()
             conn.close()
 
+        # Create tables
         create_tables()
 
-        url = f"jdbc:postgresql://{DB_HOST}:{DB_PORT}/{DB_NAME}"
-        properties = {
-            "user": DB_USER,
-            "password": DB_PASS,
-            "driver": "org.postgresql.Driver"
-        }
-                
-        dim_company_df.write.jdbc(url=url, table="finance_market.company",  mode="append", properties=properties)
-        dim_date_df.write.jdbc(url=url, table="finance_market.date",  mode="append", properties=properties)
-        fact_table.write.jdbc(url=url, table="finance_market.fact_table",  mode="append", properties=properties)
-        print('database, table and data loaded successfully')
+        # Drop duplicates from DataFrame
+        load_finance_df = load_finance_df.dropDuplicates(["ticker", "date"])
+
+        # Write to staging table
+        load_finance_df.write.jdbc(
+            url=url,
+            table="finance_market.temp_finance_market_tbl",
+            mode="overwrite",
+            properties=properties
+        )
+
+        # Merge into main table, avoiding duplicates
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT INTO finance_market.finance_market_tbl (
+                date, ticker, open, high, low, close, volume, year, month, quarter, dayofweek, isweekend
+            )
+            SELECT 
+                date, ticker, open, high, low, close, volume, year, month, quarter, dayofweek, isweekend
+            FROM finance_market.temp_finance_market_tbl
+            ON CONFLICT (ticker, date)
+            DO NOTHING;
+        ''')
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        print('Database, table, and data loaded successfully (deduplicated by ticker and date)')
     except Exception as e:
-        print("Data loading Failed!", e)
+        print("Data loading failed!", e)

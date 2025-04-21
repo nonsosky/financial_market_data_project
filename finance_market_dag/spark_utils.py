@@ -5,5 +5,5 @@ def getSparkSession():
     return SparkSession.builder \
         .appName('Finance_Market') \
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
-        .config("spark.jars", "finance_market_dag/postgresql-42.7.4.jar") \
+        .config("spark.jars", "/home/kenneth/airflow/finance_market_dag/postgresql-42.7.4.jar") \
         .getOrCreate()
